@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>3D Tetris – Enhanced (Ghost Piece, Persistent Camera, Proper Game Over)</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { display: block; }
+    #instructions {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      font-family: sans-serif;
+      background: rgba(0,0,0,0.5);
+      padding: 10px;
+      border-radius: 4px;
+      z-index: 10;
+    }
+    #gameover {
+      position: absolute;
+      top: 40%;
+      width: 100%;
+      text-align: center;
+      font-size: 48px;
+      color: red;
+      font-family: sans-serif;
+      display: none;
+      z-index: 20;
+    }
+  </style>
+</head>
+<body>
+<div id="instructions">
+  <p><strong>Controls:</strong></p>
+  <ul>
+    <li>A: Move left</li>
+    <li>D: Move right</li>
+    <li>W: Move away from the camera</li>
+    <li>S: Move toward the camera</li>
+    <li>Z: Rotate 90° about Z axis CCW</li>
+    <li>C: Rotate 90° about Z axis CW</li>
+    <li>X: Rotate 90° about X axis</li>
+    <li>Space: Hard drop</li>
+    <li>R: Restart (when game over)</li>
+    <li>Left–click &amp; drag: Rotate camera (upright)</li>
+    <li>Mouse wheel: Zoom camera in/out</li>
+  </ul>
+</div>
+<div id="gameover">GAME OVER</div>
+
+<!-- Include Three.js from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// =====================================================
+// Global Setup
+// =====================================================
+let scene, camera, renderer;
+let boardGroup;         // Group for locked cubes
+let currentPiece = null; // The falling piece (as a solid entity)
+let ghostPiece = null;   // The translucent ghost piece showing the landing position
+let lastTick = 0;
+const tickInterval = 1000; // ms between automatic drops
+let gameOverFlag = false;  // When true, game stops and displays "GAME OVER"
+
+const BOARD_WIDTH = 5;
+const BOARD_DEPTH = 5;
+const BOARD_HEIGHT = 10;
+
+let board = [];
+function initBoard() {
+  board = [];
+  for (let z = 0; z < BOARD_HEIGHT; z++) {
+    let layer = [];
+    for (let y = 0; y < BOARD_DEPTH; y++) {
+      layer.push(new Array(BOARD_WIDTH).fill(0));
+    }
+    board.push(layer);
+  }
+}
+initBoard();
+
+// Global playCenter for camera orbit (center in X/Y, lowered by one cube in Z)
+const playCenter = new THREE.Vector3((BOARD_WIDTH-1)/2, (BOARD_DEPTH-1)/2, BOARD_HEIGHT/2 - 1);
+
+// =====================================================
+// Piece Definitions
+// =====================================================
+const pieces = [
+  { // I piece
+    color: 0xff0000,
+    cells: [ [0,0,0], [1,0,0], [2,0,0], [3,0,0] ]
+  },
+  { // L piece
+    color: 0x00ff00,
+    cells: [ [0,0,0], [1,0,0], [2,0,0], [2,1,0] ]
+  },
+  { // T piece
+    color: 0x0000ff,
+    cells: [ [0,0,0], [1,0,0], [2,0,0], [1,1,0] ]
+  },
+  { // Square piece
+    color: 0xffff00,
+    cells: [ [0,0,0], [1,0,0], [0,1,0], [1,1,0] ]
+  }
+];
+
+// =====================================================
+// Helper Functions
+// =====================================================
+function computeCenter(cells) {
+  let sum = new THREE.Vector3(0,0,0);
+  cells.forEach(cell => sum.add(new THREE.Vector3(cell[0], cell[1], cell[2])));
+  return sum.divideScalar(cells.length);
+}
+  
+// =====================================================
+// Collision Detection for Solid Pieces
+// =====================================================
+function checkCollision(piece, offset = new THREE.Vector3(0,0,0), rotationDelta = new THREE.Euler(0,0,0)) {
+  let tempPos = piece.pos.clone().add(offset);
+  let tempRot = new THREE.Euler(
+    piece.rotation.x + rotationDelta.x,
+    piece.rotation.y + rotationDelta.y,
+    piece.rotation.z + rotationDelta.z,
+    piece.rotation.order
+  );
+  for (let cell of piece.cellsLocal) {
+    let pos = cell.clone().applyEuler(tempRot).add(tempPos);
+    pos.x = Math.round(pos.x);
+    pos.y = Math.round(pos.y);
+    pos.z = Math.round(pos.z);
+    if (pos.x < 0 || pos.x >= BOARD_WIDTH ||
+        pos.y < 0 || pos.y >= BOARD_DEPTH ||
+        pos.z < 0)
+      return true;
+    if (pos.z < BOARD_HEIGHT && board[pos.z][pos.y][pos.x] !== 0)
+      return true;
+  }
+  return false;
+}
+  
+function getHardDropPosition(piece) {
+  let testPos = piece.pos.clone();
+  let testPiece = { pos: testPos, rotation: piece.rotation, cellsLocal: piece.cellsLocal };
+  while (!checkCollision(testPiece, new THREE.Vector3(0,0,-1))) {
+    testPos.z -= 1;
+    testPiece.pos = testPos.clone();
+    if (testPos.z < -20) break;
+  }
+  return testPos.clone();
+}
+  
+// =====================================================
+// Piece Handling – Solid Entities
+// =====================================================
+function spawnPiece() {
+  if (gameOverFlag) return;
+  
+  const index = Math.floor(Math.random() * pieces.length);
+  const pieceDef = pieces[index];
+  
+  let center = computeCenter(pieceDef.cells);
+  center.x = Math.round(center.x);
+  center.y = Math.round(center.y);
+  center.z = Math.round(center.z);
+  
+  let cellsLocal = [];
+  pieceDef.cells.forEach(cell => {
+    let local = new THREE.Vector3(cell[0] - center.x, cell[1] - center.y, cell[2] - center.z);
+    cellsLocal.push(local);
+  });
+  
+  let group = new THREE.Group();
+  const geometry = new THREE.BoxGeometry(1,1,1);
+  const material = new THREE.MeshLambertMaterial({ color: pieceDef.color });
+  cellsLocal.forEach(local => {
+    let cube = new THREE.Mesh(geometry, material);
+    cube.position.copy(local);
+    let wireGeo = new THREE.EdgesGeometry(geometry);
+    let wireMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1, opacity: 0.25, transparent: true });
+    let wireframe = new THREE.LineSegments(wireGeo, wireMat);
+    cube.add(wireframe);
+    group.add(cube);
+  });
+  
+  let spawnX = Math.floor(BOARD_WIDTH/2);
+  let spawnY = Math.floor(BOARD_DEPTH/2);
+  let spawnZ = BOARD_HEIGHT - 1;
+  
+  currentPiece = {
+    piece: pieceDef,
+    group: group,
+    pos: new THREE.Vector3(spawnX, spawnY, spawnZ),
+    rotation: new THREE.Euler(0,0,0,'XYZ'),
+    cellsLocal: cellsLocal
+  };
+  
+  scene.add(group);
+  updatePieceTransform();
+  
+  // Immediately check for collision at spawn; if there is, end the game.
+  if (checkCollision(currentPiece)) {
+    gameOver();
+  }
+}
+  
+function updatePieceTransform() {
+  if (currentPiece) {
+    currentPiece.group.position.copy(currentPiece.pos);
+    currentPiece.group.rotation.copy(currentPiece.rotation);
+  }
+}
+  
+function updateRotationAnimation(time) {
+  if (currentPiece && currentPiece.rotationAnim) {
+    let anim = currentPiece.rotationAnim;
+    let t = (time - anim.startTime) / anim.duration;
+    if (t >= 1) {
+      currentPiece.rotation.copy(anim.target);
+      delete currentPiece.rotationAnim;
+    } else {
+      currentPiece.rotation.x = anim.start.x + (anim.target.x - anim.start.x) * t;
+      currentPiece.rotation.y = anim.start.y + (anim.target.y - anim.start.y) * t;
+      currentPiece.rotation.z = anim.start.z + (anim.target.z - anim.start.z) * t;
+    }
+    updatePieceTransform();
+  }
+}
+  
+// =====================================================
+// Board Handling
+// =====================================================
+function lockPiece() {
+  let cells = [];
+  for (let i = 0; i < currentPiece.cellsLocal.length; i++) {
+    let pos = currentPiece.cellsLocal[i].clone().applyEuler(currentPiece.rotation).add(currentPiece.pos);
+    pos.x = Math.round(pos.x);
+    pos.y = Math.round(pos.y);
+    pos.z = Math.round(pos.z);
+    cells.push(pos);
+  }
+  scene.remove(currentPiece.group);
+  for (let i = 0; i < cells.length; i++) {
+    let pos = cells[i];
+    if (pos.z >= BOARD_HEIGHT) { gameOver(); return; }
+    board[pos.z][pos.y][pos.x] = currentPiece.piece.color;
+    addCubeToBoard(pos.x, pos.y, pos.z, currentPiece.piece.color);
+  }
+  clearFullLayers();
+  spawnPiece();
+}
+  
+function addCubeToBoard(x, y, z, color) {
+  const material = new THREE.MeshLambertMaterial({ color: color });
+  const geometry = new THREE.BoxGeometry(1,1,1);
+  let cube = new THREE.Mesh(geometry, material);
+  cube.position.set(x, y, z);
+  let wireGeo = new THREE.EdgesGeometry(geometry);
+  let wireMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1, opacity: 0.25, transparent: true });
+  let wireframe = new THREE.LineSegments(wireGeo, wireMat);
+  cube.add(wireframe);
+  boardGroup.add(cube);
+}
+  
+function clearFullLayers() {
+  for (let z = 0; z < BOARD_HEIGHT; z++) {
+    let full = true;
+    for (let y = 0; y < BOARD_DEPTH; y++) {
+      for (let x = 0; x < BOARD_WIDTH; x++) {
+        if (board[z][y][x] === 0) { full = false; break; }
+      }
+      if (!full) break;
+    }
+    if (full) {
+      boardGroup.children = boardGroup.children.filter(cube => Math.round(cube.position.z) !== z);
+      board.splice(z, 1);
+      let newLayer = [];
+      for (let y = 0; y < BOARD_DEPTH; y++) {
+        newLayer.push(new Array(BOARD_WIDTH).fill(0));
+      }
+      board.push(newLayer);
+      boardGroup.children.forEach(cube => {
+        if (Math.round(cube.position.z) > z)
+          cube.position.z -= 1;
+      });
+      z--;
+    }
+  }
+}
+  
+// =====================================================
+// Ghost Piece Visualization
+// =====================================================
+// Create a translucent ghost copy of the current piece exactly at its hard drop position.
+function updateGhostPiece() {
+  // Remove the old ghost piece from the scene if it exists.
+  if (ghostPiece) {
+    scene.remove(ghostPiece);
+    ghostPiece = null;
+  }
+  
+  // Compute the hard drop (landing) position for the current piece.
+  let landingPos = getHardDropPosition(currentPiece);
+  
+  // If the landing position is the same as the current position,
+  // we consider that there is no drop space; so we do not render a ghost piece.
+  if (landingPos.z === currentPiece.pos.z) return;
+  
+  // Clone the current piece's group to create a ghost.
+  ghostPiece = currentPiece.group.clone();
+  // Set the ghost piece's position to the landing position and use the same rotation.
+  ghostPiece.position.copy(landingPos);
+  ghostPiece.rotation.copy(currentPiece.rotation);
+  
+  // Traverse the ghost piece and update its materials to be translucent.
+  ghostPiece.traverse(child => {
+    if (child.isMesh) {
+      // Create a new material based on the original color.
+      child.material = new THREE.MeshBasicMaterial({ 
+        color: child.material.color, 
+        opacity: 0.3, 
+        transparent: true,
+        depthWrite: false
+      });
+      // Optionally remove any wireframe children.
+      if (child.children.length > 0) {
+        child.children = [];
+      }
+    }
+  });
+  
+  scene.add(ghostPiece);
+}
+  
+// =====================================================
+// Game Over Rendering
+// =====================================================
+function showGameOverText() {
+  document.getElementById("gameover").style.display = "block";
+}
+  
+// =====================================================
+// Game Loop
+// =====================================================
+function gameTick() {
+  if (gameOverFlag) return;
+  if (!checkCollision(currentPiece, new THREE.Vector3(0,0,-1))) {
+    currentPiece.pos.z -= 1;
+    updatePieceTransform();
+  } else {
+    lockPiece();
+  }
+}
+  
+function animate(time) {
+  requestAnimationFrame(animate);
+  updateRotationAnimation(time);
+  updatePieceTransform();
+  if (time - lastTick > tickInterval) {
+    gameTick();
+    lastTick = time;
+  }
+  if (currentPiece) updateGhostPiece();
+  renderer.render(scene, camera);
+}
+  
+// =====================================================
+// Input Handling for Pieces (Camera–Relative Movement & Animated Rotations)
+// =====================================================
+document.addEventListener('keydown', event => {
+  if (!currentPiece || gameOverFlag) return;
+  let moved = false;
+  const key = event.key.toLowerCase();
+  
+  let camForward = new THREE.Vector3();
+  camera.getWorldDirection(camForward);
+  camForward.z = 0;
+  camForward.normalize();
+  let camRight = new THREE.Vector3().crossVectors(camForward, new THREE.Vector3(0,0,1)).normalize();
+  
+  let moveOffset = new THREE.Vector3();
+  if (key === 's') {
+    moveOffset.copy(camForward).negate();
+  } else if (key === 'w') {
+    moveOffset.copy(camForward);
+  } else if (key === 'd') {
+    moveOffset.copy(camRight);
+  } else if (key === 'a') {
+    moveOffset.copy(camRight).negate();
+  }
+  moveOffset.x = Math.round(moveOffset.x);
+  moveOffset.y = Math.round(moveOffset.y);
+  moveOffset.z = 0;
+  
+  if (['w','a','s','d'].includes(key)) {
+    if (!checkCollision(currentPiece, moveOffset)) {
+      currentPiece.pos.add(moveOffset);
+      moved = true;
+    }
+  } else if (key === 'z' || key === 'c' || key === 'x') {
+    let delta;
+    if (key === 'z') {
+      delta = new THREE.Euler(0, 0, Math.PI/2, 'XYZ'); // CCW about Z
+    } else if (key === 'c') {
+      delta = new THREE.Euler(0, 0, -Math.PI/2, 'XYZ'); // CW about Z
+    } else if (key === 'x') {
+      delta = new THREE.Euler(Math.PI/2, 0, 0, 'XYZ'); // about X
+    }
+    if (!currentPiece.rotationAnim && !checkCollision(currentPiece, new THREE.Vector3(0,0,0), delta)) {
+      currentPiece.rotationAnim = {
+        start: currentPiece.rotation.clone(),
+        target: new THREE.Euler(
+          currentPiece.rotation.x + delta.x,
+          currentPiece.rotation.y + delta.y,
+          currentPiece.rotation.z + delta.z,
+          currentPiece.rotation.order
+        ),
+        startTime: performance.now(),
+        duration: 200
+      };
+      moved = true;
+    }
+  } else if (key === ' ') {
+    while (!checkCollision(currentPiece, new THREE.Vector3(0,0,-1))) {
+      currentPiece.pos.z -= 1;
+    }
+    moved = true;
+  } else if (key === 'r' && gameOverFlag) {
+    gameOverFlag = false;
+    document.getElementById("gameover").style.display = "none";
+    initBoard();
+    while (boardGroup.children.length > 0) {
+      boardGroup.remove(boardGroup.children[0]);
+    }
+    spawnPiece();
+  }
+  if (moved) updatePieceTransform();
+});
+  
+// =====================================================
+// Upright Orbit Camera Controls & Persistence
+// =====================================================
+function saveCameraSettings() {
+  const settings = {
+    orbitRadius: orbitRadius,
+    orbitAzimuth: orbitAzimuth,
+    orbitElevation: orbitElevation
+  };
+  localStorage.setItem("tetrisCamera", JSON.stringify(settings));
+}
+  
+function loadCameraSettings() {
+  const settings = localStorage.getItem("tetrisCamera");
+  if (settings) {
+    const parsed = JSON.parse(settings);
+    orbitRadius = parsed.orbitRadius;
+    orbitAzimuth = parsed.orbitAzimuth;
+    orbitElevation = parsed.orbitElevation;
+  } else {
+    orbitRadius = 10;
+    orbitAzimuth = 0;
+    orbitElevation = 0.3;
+  }
+}
+  
+function updateCameraPosition() {
+  camera.position.x = playCenter.x + orbitRadius * Math.cos(orbitElevation) * Math.cos(orbitAzimuth);
+  camera.position.y = playCenter.y + orbitRadius * Math.cos(orbitElevation) * Math.sin(orbitAzimuth);
+  camera.position.z = playCenter.z + orbitRadius * Math.sin(orbitElevation);
+  camera.lookAt(playCenter);
+  saveCameraSettings();
+}
+  
+function setupMouseControls() {
+  renderer.domElement.addEventListener('mousedown', function(e) {
+    if (e.button === 0) {
+      isDragging = true;
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    }
+  }, false);
+  document.addEventListener('mousemove', function(e) {
+    if (isDragging) {
+      const deltaMove = { x: e.clientX - previousMousePosition.x, y: e.clientY - previousMousePosition.y };
+      const sensitivity = 0.005;
+      orbitAzimuth -= deltaMove.x * sensitivity;
+      orbitElevation += deltaMove.y * sensitivity;
+      const maxElevation = Math.PI/2 - 0.01;
+      const minElevation = -Math.PI/2 + 0.01;
+      orbitElevation = Math.max(minElevation, Math.min(maxElevation, orbitElevation));
+      updateCameraPosition();
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    }
+  }, false);
+  document.addEventListener('mouseup', function(e) { if (e.button === 0) isDragging = false; }, false);
+  document.addEventListener('mouseleave', function(e) { isDragging = false; }, false);
+  renderer.domElement.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    const zoomSensitivity = 0.05;
+    orbitRadius += e.deltaY * zoomSensitivity;
+    orbitRadius = Math.max(5, Math.min(50, orbitRadius));
+    updateCameraPosition();
+  }, { passive: false });
+}
+  
+let isDragging = false;
+let previousMousePosition = { x: 0, y: 0 };
+  
+// =====================================================
+// Checkered Floor
+// =====================================================
+function createCheckeredFloor() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2;
+  canvas.height = 2;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#777';
+  ctx.fillRect(0,0,1,1);
+  ctx.fillRect(1,1,1,1);
+  ctx.fillStyle = '#333';
+  ctx.fillRect(1,0,1,1);
+  ctx.fillRect(0,1,1,1);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestFilter;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(BOARD_WIDTH/2, BOARD_DEPTH/2);
+  const geometry = new THREE.PlaneGeometry(BOARD_WIDTH, BOARD_DEPTH);
+  const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+  const floor = new THREE.Mesh(geometry, material);
+  floor.position.set((BOARD_WIDTH-1)/2, (BOARD_DEPTH-1)/2, -0.5);
+  return floor;
+}
+  
+// =====================================================
+// Game Over & Initialization
+// =====================================================
+function gameOver() {
+  gameOverFlag = true;
+  document.getElementById("gameover").style.display = "block";
+}
+  
+// Separate initialization functions for clarity
+
+function initScene() {
+  scene = new THREE.Scene();
+}
+
+function initCamera() {
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+  camera.up.set(0, 0, 1);
+  camera.position.set(BOARD_WIDTH / 2, -BOARD_DEPTH * 2, BOARD_HEIGHT);
+  camera.lookAt(new THREE.Vector3(BOARD_WIDTH / 2, BOARD_DEPTH / 2, BOARD_HEIGHT / 2));
+}
+
+function initRenderer() {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+function initLights() {
+  scene.add(new THREE.AmbientLight(0x404040));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(1, 1, 2);
+  scene.add(dirLight);
+}
+
+function initBoardAndFloor() {
+  boardGroup = new THREE.Group();
+  scene.add(boardGroup);
+  const floor = createCheckeredFloor();
+  scene.add(floor);
+}
+
+function initGameElements() {
+  gameOverFlag = false;
+  spawnPiece();
+  lastTick = performance.now();
+}
+
+function initCameraControls() {
+  loadCameraSettings();
+  // Calculate orbit settings based on camera offset from playCenter
+  const offset = new THREE.Vector3().subVectors(camera.position, playCenter);
+  orbitRadius = offset.length();
+  orbitElevation = Math.asin(offset.z / orbitRadius);
+  orbitAzimuth = Math.atan2(offset.y, offset.x);
+  updateCameraPosition();
+  setupMouseControls();
+}
+
+function init() {
+  initScene();
+  initCamera();
+  initRenderer();
+  initLights();
+  initBoardAndFloor();
+  initGameElements();
+  initCameraControls();
+  animate(performance.now());
+}
+init();
+</script>
+</body>
+</html>
